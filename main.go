@@ -10,7 +10,6 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
-	"os"
 	"testing/fstest"
 	"time"
 
@@ -18,13 +17,18 @@ import (
 	"github.com/moby/moby/client"
 )
 
-//go:embed image/* tests/*
+//go:embed image/* tests/**/test.ts tests/**/README.md tests/**/code.ts
 var files embed.FS
 
 type Code struct {
 	User string `json:"user"`
 	Code string `json:"code"`
-	Task string `json:"task"`
+}
+
+type Test struct {
+	Name string `json:"name"`
+	Base string `json:"base"`
+	Desc string `json:"desc"`
 }
 
 func createFS(task string, code string) fstest.MapFS {
@@ -37,7 +41,7 @@ func createFS(task string, code string) fstest.MapFS {
 		panic(err)
 	}
 
-	testFile, err := files.ReadFile(fmt.Sprintf("tests/%s.ts", task))
+	testFile, err := files.ReadFile(fmt.Sprintf("tests/%s/test.ts", task))
 	if err != nil {
 		panic(err)
 	}
@@ -114,16 +118,9 @@ func executeCodeTest(code string, task string, user string) []byte {
 		panic(fmt.Errorf("creating image rar %e", err))
 	}
 
-	buildOutput, err := cli.ImageBuild(ctx, imageContext, client.ImageBuildOptions{Tags: []string{imageName}, Dockerfile: "/Dockerfile", Remove: false})
+	_, err = cli.ImageBuild(ctx, imageContext, client.ImageBuildOptions{Tags: []string{imageName}, Dockerfile: "/Dockerfile", Remove: false})
 	if err != nil {
-		panic(fmt.Errorf("building image", err))
-	}
-
-	defer buildOutput.Body.Close()
-
-	_, err = io.ReadAll(buildOutput.Body)
-	if err != nil {
-		fmt.Printf("error reading body %e", err)
+		panic(fmt.Errorf("building image %e", err))
 	}
 
 	containerOutput, err := cli.ContainerCreate(ctx, &container.Config{
@@ -132,6 +129,13 @@ func executeCodeTest(code string, task string, user string) []byte {
 	if err != nil {
 		fmt.Printf("error creating container %e", err)
 	}
+
+	defer func() {
+		err := cli.ContainerRemove(ctx, containerOutput.ID, client.ContainerRemoveOptions{})
+		if err != nil {
+			fmt.Printf("error deleting container %s", containerOutput.ID)
+		}
+	}()
 
 	err = cli.ContainerStart(ctx, containerOutput.ID, client.ContainerStartOptions{})
 	if err != nil {
@@ -147,25 +151,25 @@ func executeCodeTest(code string, task string, user string) []byte {
 	case <-waitChannel:
 	}
 
-	output, err := cli.ContainerLogs(ctx, containerOutput.ID, client.ContainerLogsOptions{
-		ShowStdout: true,
-		ShowStderr: true,
-	})
+	report, _, err := cli.CopyFromContainer(ctx, containerOutput.ID, "/test/report.xml")
 	if err != nil {
-		fmt.Printf("error getting logs %e", err)
+		fmt.Printf("error getting report %e", err)
 	}
 
-	defer output.Close()
+	defer report.Close()
 
-	io.Copy(os.Stdout, output)
-
-	logs, err := io.ReadAll(output)
+	tarReader := tar.NewReader(report)
+	_, err = tarReader.Next()
 
 	if err != nil {
-		fmt.Printf("error reading logs %e", err)
+		fmt.Printf("error untarring report %e", err)
 	}
 
-	return logs
+	logBuffer := bytes.Buffer{}
+
+	io.Copy(&logBuffer, tarReader)
+
+	return logBuffer.Bytes()
 }
 
 func main() {
@@ -178,8 +182,9 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	router.HandleFunc("POST /run", func(w http.ResponseWriter, r *http.Request) {
+	router.HandleFunc("POST /test/{test}/run", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		test := r.PathValue("test")
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			fmt.Printf("Error reading body: %e", err)
@@ -196,10 +201,37 @@ func main() {
 			return
 		}
 
-		output := executeCodeTest(code.Code, code.Task, code.User)
+		output := executeCodeTest(code.Code, test, code.User)
 
+		w.Header().Set("Content-Type", "application/xml")
 		w.WriteHeader(200)
 		w.Write(output)
+	})
+
+	router.HandleFunc("GET /test/{test}", func(w http.ResponseWriter, r *http.Request) {
+		test := r.PathValue("test")
+		code, err := files.ReadFile(fmt.Sprintf("tests/%s/code.ts", test))
+		if err != nil {
+			w.WriteHeader(404)
+			w.Write([]byte("Can't get base code for " + test))
+			return
+		}
+		desc, err := files.ReadFile(fmt.Sprintf("tests/%s/README.md", test))
+		if err != nil {
+			w.WriteHeader(404)
+			w.Write([]byte("Can't get description for " + test))
+			return
+		}
+
+		testData := Test{
+			Name: test,
+			Base: string(code),
+			Desc: string(desc),
+		}
+
+		resp, _ := json.Marshal(testData)
+
+		w.Write(resp)
 	})
 
 	http.ListenAndServe(":8086", &router)
